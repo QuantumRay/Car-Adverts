@@ -1,0 +1,692 @@
+---
+title: Car Adverts
+author: Spiridon Zarkov
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+---
+
+One month of data has been gathered about car ads. Now the team is focused on brining buyers and sellers together to make a great deal. Sellers place ads, and buyers look for these ads by browsing or searching on the site. When a buyer finds an ad they find interesting in the result list and clicks it, we call this a ‘View Item page’- a VIP view. When a buyer proceeds to contact a seller to get more info or strike a deal, we call this a lead. They can do so by calling (Phone click), asking a question over email (ASQ: ask seller Question), clicking out to a seller’s website (URL_CLICK) or placing a bid.
+
+Lets see what we can infer from this data and what type of predictive model we will be able to build.
+
+Metadata:
+
+- src_ad_id: id of ad
+- telclicks: number of phone clicks
+- bids: number of bids
+- carrosserie: vehicle type
+- photo_cnt: number of photos
+- aantaldeuren: number of doors
+- n_asq: number of emails sent to seller
+- bouwjaar: year the car was built
+- emmisie: emissions
+- energielabel: energy label
+- brand: brand of car
+- ad_start_dt: ad start date
+- vermogen: horsepower
+- webclicks: number of clicks to sellers website
+- model: model of the car
+- aantalstoelen: number of seats
+- price: price tag
+- test group: whether car was in test group "A", "B", or no test group
+
+```{r, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(RANN)
+library(h2o)
+library(caret)
+library(gridExtra)
+library(corrplot)
+library(tidyr)
+library(cvAUC)
+library(prettydoc)
+library(plotly)
+h2o.init(nthreads = -2, max_mem_size = "26G")
+sessionInfo()
+```
+
+Lets begin by reading in and examining our data
+```{r, warning = FALSE, message = FALSE}
+## Importing the Data
+# Setup how the classes will be read in
+class <- c("numeric", "numeric", "numeric", "character", "character", "numeric",
+           "numeric", "numeric", "factor", "numeric", "character", "numeric", 
+           "factor", "factor", "numeric", "character", "numeric", "numeric",
+           "character", "character", "numeric", "factor", "character")
+
+path <- c("./input/cars_dataset.csv")
+
+# Read in and examine the data
+cars <- data.table::fread(path, colClasses = class)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Summary Statistics
+str(cars)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Dimensions
+dim(cars)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# clean the test group and check data
+cars$test_group_clean <- factor(ifelse(cars$`test group` == "a", "A", 
+                                ifelse(cars$`test group` == "b", "B", 
+                                "Missing")))
+# Most of the data is missing
+# Assumption for missing data is to get an accurate statistical significance
+# as a very large sample size can achieve statistical significane without relevance
+# Not a useful variable unless we examining the A/B Test Results
+table(cars$test_group_clean)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Lets explore the data further
+# How much data is missing?
+missing_values <- cars %>% summarise_all(funs(sum(is.na(.))/n()))
+missing_values <- gather(missing_values, key = "feature", value = "missing_pct")
+missing_values %>%
+  ggplot(aes(x = reorder(feature, - missing_pct), y = missing_pct)) +
+  geom_bar(stat = "identity", fill = "red") +
+  coord_flip() + theme_bw()
+
+# A very small percentage of data is NA
+# We will likely not need to do any KNN/RF imputations
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Examine the Bouwjaar Feature
+# Year 2000 needs to be cleaned
+table(cars$bouwjaar)
+cars$bouwjaar <- ifelse(cars$bouwjaar == "2.00E+03", "2000", cars$bouwjaar)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Create an age variable from date information
+# ad start date + days live could be used instead of system time but
+# lets the date as of the date of analysis
+# transform some features by year using the new age variable
+# in order to boost our predictive model power
+cars$bouwjaar <- ifelse(cars$bouwjaar == "2.00E+03", "2000", cars$bouwjaar)
+cars <- cars %>% mutate(age = as.numeric(format(Sys.Date(), "%Y")) -
+                        as.integer(cars$bouwjaar),
+                        annual_emissions = as.numeric(emissie)/age,
+                        annual_kms = kmstand / age)
+# create an age grouping
+cars <- cars %>% mutate(ageGroup = ifelse(age<= 3, "(<=3)", 
+                                   ifelse(3 < age & age <= 6, "(4-6)",
+                                   ifelse(5 < age & age <= 10, "(7-10)",
+                                   ifelse(10 < age & age <= 15, "(11-15)",
+                                   ifelse(15 < age & age <= 20, "(16-20)", "(20+)"))))))
+cars$ageGroup <- as.factor(cars$ageGroup)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Now lets do a visual exploration of our new feature
+# View distribution of variable
+# Most packed around the 5 Year mark
+cars %>% 
+  ggplot(aes(x=age))+geom_line(stat="density", color="red", size=1.2)+theme_bw()
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Histogram for a view from another angle by year
+ggplot(aes(cars$age), data=cars) +
+  geom_histogram(color='white', fill='lightblue') +
+  scale_x_continuous(limit=c(0, 35), breaks=seq(0, 35, 2)) +
+  labs(x= 'Car Age', y= 'Number of Cars', title= 'Car Age Histogram')
+```
+
+```{r, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 7}
+# See if we can unconver anything by segregating by car type
+# We have a "?" factor 
+# overiege have a broad spectrum of ages
+ggplot(aes(x= carrosserie, y= age), data=cars) +
+  geom_boxplot(fill="lightblue", color='black') +
+  geom_boxplot(aes(fill = carrosserie)) +
+  stat_summary(fun.y = mean, geom="point", size=2) +
+  labs(x= 'Vehicle Type', y= 'Age') +
+  ggtitle('Age vs. Vehicle Type')
+```
+
+```{r Vehicle Type Diagram, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 7}
+# Examine Car Types
+# We have a very high amount of "Hatchbacks" in our dataset
+ggplot(cars, aes(x=carrosserie, fill = carrosserie)) + 
+  geom_bar() +
+  labs(x= 'Vehicle Type', y= 'Number of Cars') +
+  ggtitle('Vehicle Type Frequency Diagram')  
+  # scale_x_(breaks = seq(0, 4.8, 0.5), minor_breaks = seq(0, 4.8, 0.1))
+```
+
+```{r, warning = FALSE, message = FALSE}
+# How long before a car is sold?
+# Most cars carry on for the 30+ days
+ggplot(data=cars, aes(cars$days_live)) + 
+  geom_histogram(breaks=seq(0, 35, by = 5), 
+                 col="red", 
+                 fill="green", 
+                 alpha = .2) + 
+  labs(title="Histogram for Days Live") +
+  labs(x="Days Live", y="Count")
+```
+
+```{r, warning = FALSE, message = FALSE}
+# create total clicks variable
+cars <- cars %>% mutate(total_clicks = (telclicks + webclicks + n_asq +bids))
+
+# create the response variable (label)
+cars$clicked       <- ifelse(cars$total_clicks > 0, 1, 0)
+cars$clicked       <- as.factor(cars$clicked)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# examine response variable
+# as expected, most clicks fall into 0 or 1
+ggplot(data=cars, aes(cars$total_clicks)) + 
+  geom_histogram(breaks=seq(0, 35, by = 5), 
+                 col="red", 
+                 fill="green", 
+                 alpha = .2) + 
+  labs(title="Histogram for Total Clicks") +
+  labs(x="Total Clicks", y="Count")
+```
+
+```{r, warning = FALSE, message = FALSE}
+# now that we have our label, lets examine the A/B test results
+# create new table with only A/B test results for later analysis
+cars_ab <- cars %>% filter(test_group_clean == "A" | test_group_clean == "B")
+cars_a <- cars %>% filter(test_group_clean == "A")
+cars_b <- cars %>% filter(test_group_clean == "B")
+
+# summary(cars_a)
+# summary(cars_b)
+# Examining the Data, the only difference between the groups we found was that
+# Group B has Higher Mean Price than Group A
+t.test(price ~ test_group_clean, data = cars_ab, alternative = "less")
+```
+
+```{r, warning = FALSE, message = FALSE}
+# hypothesis seems to be that price will affect our click rate on ads
+# lets test this out, group A has significantly more clicks than group B
+t.test(total_clicks ~ test_group_clean, data = cars_ab, alternative= "greater")
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Looks like the groups may be split up to see impact of clicks by price
+# lets visualize what that looks like
+ggplot(na.omit(cars_ab), aes(x = scale(total_clicks), y = scale(price), color = test_group_clean)) +
+  geom_point() +
+  labs(title = "Clicks by Price in A/B Test (Scaled)") +
+  labs(color = "Test Groups") +
+  labs(x = "Total Clicks", y = "Price")
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Calculating the confidence intervals for each group by total clicks now
+# Group A
+error_tca <- qt(0.90, df=length(cars_a$total_clicks) - 1) * sd(cars_a$total_clicks) / sqrt(length(cars_a$total_clicks))
+left_tca <- mean(cars_a$total_clicks) - error_tca
+right_tca<- mean(cars_a$total_clicks) + error_tca
+left_tca; right_tca
+# Group B
+error_tcb <- qt(0.90, df=length(cars_b$total_clicks) - 1) * sd(cars_b$total_clicks, na.rm = T) / sqrt(length(cars_b$total_clicks))
+left_tcb <- mean(cars_b$total_clicks, na.rm = T) - error_tcb
+right_tcb <- mean(cars_b$total_clicks, na.rm = T) + error_tcb
+left_tcb; right_tcb
+
+# Calculate Click change based on price in groups
+clicks_a <- 25.91237
+clicks_b <- 15.78852
+clicks_t <- clicks_a + clicks_b
+conversion <- clicks_a/clicks_t - clicks_b/clicks_t
+rate <- round(conversion * 100, 2)
+# Receieved 24% more clicks in Group A on Average
+rate
+```
+
+```{r, warning = FALSE, message = FALSE, fig.width = 9, fig.height = 8}
+# Examine Three Charts Together
+# Standard Deviation of Clicks through Days Live
+# Median Clicks through Days Live
+# Count of Clicks through Days Live
+# Again, high amount of observations are on the Hatback and throughout the month decreases
+# The abundance of hatchbacks in the early days will skew our A/B Test results for any inference
+days_liveGroup <- group_by(days_live, carrosserie, .data = cars_ab)
+days_clicks <- summarise(days_liveGroup,
+                         sd_clicks = sd(total_clicks, na.rm = T),
+                         median_clicks = median(total_clicks, na.rm = T),
+                         count = n())
+p1 <- ggplot(days_clicks) + 
+  geom_smooth(aes(x=days_live, y=sd_clicks, color=carrosserie), se = F) + 
+  xlim(0,30) +
+  labs(color = "Vehicles") +
+  labs(x = "Days Live", y = "Deviation of Clicks")
+p2 <- ggplot(days_clicks) + 
+  geom_smooth(aes(x=days_live, y=median_clicks, color=carrosserie), se = F) + 
+  xlim(0,30) +
+  labs(color = "Vehicles") +
+  labs(x = "Days Live", y = "Median Clicks")
+p3 <- ggplot(days_clicks) + 
+  geom_smooth(aes(x=days_live, y=count, color=carrosserie), se = F) + 
+  xlim(0,30) +
+  labs(color = "Vehicles") +
+  labs(x = "Days Live", y = "Count")
+grid.arrange(p1, p2, p3, ncol = 1)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Created an interactive graph so we can play with the data
+# lets examine the count data for the entire lifecycle
+# Hatchbacks highly popular within test groups
+cars_count <- ggplot(days_clicks) + 
+  geom_smooth(aes(x=days_live, y=count, color=carrosserie), se = F) + 
+  xlim(0,150) +
+  labs(title = "Clicks per Vehicle by Days Live") +
+  labs(color = "Vehicles") +
+  labs(x = "Days Live", y = "Count") 
+ggplotly(cars_count)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Examine some summary statistics of the Hatcback
+# it is below the mean/median price of the group
+# it has less power than the average car in the group
+# it has less kilometers ran on average even though the age is about the same as group
+cars_ab %>% filter(carrosserie == "Hatchback (3/5-deurs)") %>% 
+  select(photo_cnt, vermogen, price, age, kmstand, test_group_clean) %>% 
+  summary()
+cars_ab %>% filter(carrosserie != "Hatchback (3/5-deurs)") %>% 
+  select(photo_cnt, vermogen, price, age, kmstand, test_group_clean) %>% 
+  summary()
+```
+
+```{r, warning = FALSE, message = FALSE}
+# New table with more evenly distributed car data
+cars_ab_recent <- cars_ab %>% filter(carrosserie != "Hatchback (3/5-deurs)")
+t.test(total_clicks ~ test_group_clean, data = cars_ab_recent)
+
+# Calculate Click change based on price in groups
+clicks_ab <- 21.95314
+clicks_ba <- 12.43557
+clicks_tt <- clicks_ab + clicks_ba
+conversion_smooth <- clicks_ab/clicks_tt - clicks_ba/clicks_tt
+rate_smooth <- round(conversion_smooth * 100, 2)
+# Receieved 28% more clicks in Group A on Average
+# Customers in these samples are more likely to click on cheap cars
+# Even when we remove the cheap Hatchback as a highly popular option
+rate_smooth
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Having concluded our A/B Analysis, lets go back to our main data
+# After examining the variables, we found that many had a "?" or "None" field as factors
+# so clean some of the missing/dirty data from these features
+cars$kleur         <- as.factor(ifelse(cars$kleur == "?", 
+                                "Other", cars$kleur))
+cars$carrosserie   <- as.factor(ifelse(cars$carrosserie == "?",
+                                "Other", cars$carrosserie))
+cars$aantaldeuren  <- as.factor(ifelse(cars$aantaldeuren == "None", 
+                                "Other", cars$aantaldeuren))
+cars$energielabel  <- as.factor(ifelse(cars$energielabel == "?", 
+                                "Other", cars$energielabel))
+cars$aantalstoelen <- as.factor(as.numeric(cars$aantalstoelen))
+cars$aantalstoelen <- as.factor(ifelse(is.na(cars$aantalstoelen), 
+                                "Other", cars$aantalstoelen))
+cars$photo_cnt     <- as.factor(cars$photo_cnt)
+cars$emissie       <- as.numeric(cars$emissie)
+
+# Drop out any price that is unrealistic
+# €0 for a car, or 100 million for a volvo, etc.
+cars$price <- ifelse(cars$price < quantile(cars$price, 0.05, na.rm = T), NA,
+              ifelse(cars$price > quantile(cars$price, 0.98, na.rm = T), NA, cars$price))
+```
+
+```{r, warning = FALSE, message = FALSE}
+# "Model" alone has no predictive power but combined with the brand it may
+# Combine the Brand and Model of Cars
+# Now we can drop "Model" as its mostly noise for our algorithm
+cars$brand <- str_replace_all(cars$brand, pattern = "[[:punct:]]", "")
+cars$brand <- str_replace_all(cars$brand, pattern = "\\s+", " ")
+cars$label <- as.factor(paste(cars$brand, cars$model, sep = " "))
+cars$label <- str_replace_all(cars$label, pattern = "[[:punct:]]", "")
+cars$label <- str_replace_all(cars$label, pattern = "\\s+", " ")
+
+# Let examine our data and see whats popular for our ads
+# Format the Cars Labels
+cars$label <- as.factor(tolower(cars$label))
+all_labels <- str_split(cars$label, " ")
+
+# how many words per label
+words_per_label <- sapply(all_labels, length)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# table of frequencies
+table(words_per_label)
+# to get it as a percent
+100 * round(table(words_per_label)/length(words_per_label), 4)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# vector of words in labels
+title_words <- unlist(all_labels)
+# get unique words
+unique_words <- unique(title_words)
+num_unique_words <- length(unique(title_words))
+# vector to store counts
+count_words <- rep(0, num_unique_words)
+# count number of occurrences
+for (i in 1:num_unique_words) {
+count_words[i] = sum(title_words == unique_words[i])
+}
+# index values in decreasing order
+top_30_order <- order(count_words, decreasing = TRUE)[1:30]
+# top 30 frequencies
+top_30_freqs <- sort(count_words, decreasing = TRUE)[1:30]
+# select top 30 words
+top_30_words <- unique_words[top_30_order]
+```
+
+```{r, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 6}
+# barplot
+# Volkswagen seems to be far ahead of the others
+barplot(top_30_freqs, border = NA, names.arg = top_30_words,
+        las = 2, ylim = c(0,25000))
+```
+```{r, warning = FALSE, message = FALSE}
+# Lets see what vehicle type relates to the highest brand
+# similar to our AB test results of Hatchback
+# the three most popular cars all have Hatchback types
+cars %>% 
+  group_by(brand, carrosserie) %>% 
+  mutate(count = n()) %>%
+  select(brand, carrosserie, count) %>%
+  arrange(desc(count)) %>% 
+  unique() %>% 
+  head()
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Any other features worth creating?
+# We can bin certain variables if they are worthwhile
+# Vermogen can be split into High,Low Power
+# Emissiens can be split into High, Low Emission Cars
+cars %>% select(age, price, kmstand, vermogen, days_live, total_clicks, emissie) %>%
+ cor(use = "complete.obs") %>% corrplot::corrplot()
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Features to Drop
+# V23 is Empty, Clicks cause leakage, test_group is mostly NA, 
+# model has too many factors with no value, date was used in Age
+# l2 is unknown but mostly noise
+table(cars$l2)
+```
+
+```{r, warning = FALSE, message = FALSE}
+# Select final features, drop ones we won't use or could cause data leakage
+features <- cars %>%
+  select(- `test group`, - V23, - test_group_clean, - model, - ad_start_dt,
+         - src_ad_id, - bouwjaar, - l2, - webclicks, - telclicks, - total_clicks,
+         - n_asq, - bids)
+str(features)
+```
+
+```{r, eval=F, echo=T}
+## Examine the Machine Learning Algorithms we will use
+# H2O library was used for performance gains
+# Algorithms that can effectively handle NA's were used (RF Imputation was used with no difference)
+# Algorithms that can effectively scale were used (YeoJohnson was used with no difference)
+cars_h2o <- as.h2o(features)
+
+# Split into Training/Validation/Testing sets
+splits <- h2o.splitFrame(data = cars_h2o, ratios = c(0.7, 0.15), seed = 1)
+
+train <- splits[[1]]
+validate <- splits[[2]]
+test <- splits[[3]]
+
+# Define Label and Predictors
+response <- "clicked"
+predictors <- setdiff(names(train), response)
+
+# Define as Factor since we want to know if its a Click (1) or Not (0)
+train[,response] <- as.factor(train[,response])
+validate[,response] <- as.factor(validate[,response])
+test[,response] <- as.factor(test[,response])
+```
+
+```{r, eval=F, echo=T}
+# GBM Algorithm with minor human tuning
+# One Hot Encoded Variables as it usually improves AUC
+gbm_fit <- h2o.gbm(x = predictors,
+                   y = response,
+                   training_frame = train,
+                   model_id = "gbm_fit",
+                   validation_frame = validate,
+                   ntrees = 500,
+                   score_tree_interval = 5,
+                   stopping_rounds = 3,
+                   stopping_metric = "AUC",
+                   stopping_tolerance = 0.0005,
+                   categorical_encoding = "OneHotExplicit",
+                   seed = 1)
+gbm_perf <- h2o.performance(model = gbm_fit,
+                            newdata = test)
+
+# Distributed RandomForest
+rf_fit <- h2o.randomForest(x = predictors,
+                           y = response,
+                           training_frame = train,
+                           model_id = "rf_fit",
+                           seed = 1,
+                           nfolds = 5)
+rf_perf <- h2o.performance(model = rf_fit,
+                           newdata = test)
+# Deep Learning with minor human tuning
+dl_fit <- h2o.deeplearning(x = predictors,
+                           y = response,
+                           training_frame = train,
+                           model_id = "dl_fit",
+                           validation_frame = validate,  
+                           epochs = 20,
+                           hidden = c(10,10),
+                           score_interval = 1,           
+                           stopping_rounds = 3,          
+                           stopping_metric = "AUC",      
+                           stopping_tolerance = 0.0005,
+                           variable_importances = T,
+                           seed = 1)
+dl_perf <- h2o.performance(model = dl_fit,
+                           newdata = test)
+
+# Naive Bayes, rarely beats the others but its very fast
+nb_fit <- h2o.naiveBayes(x = predictors,
+                         y = response,
+                         training_frame = train,
+                         model_id = "nb_fit",
+                         laplace = 6,
+                         seed = 1)
+nb_perf <- h2o.performance(model = nb_fit,
+                           newdata = test)
+
+# Generalized Linear Model with Binomial Family
+glm_fit <- h2o.glm( x = predictors, 
+                    y = response, 
+                    training_frame = train,
+                    model_id = "glm_fit",
+                    validation_frame = validate,
+                    family = "binomial",
+                    lambda_search = TRUE)
+glm_perf <- h2o.performance(model = glm_fit,
+                            newdata = test)
+```
+
+```{r, eval=F, echo=T}
+# Lets examine the results based on AUC
+# RF/DL/GBM performed quite close 
+# GBM had the best AUC but it was also the slowest
+# Area under the Curve
+h2o.auc(rf_perf) # 0.7841405
+h2o.auc(dl_perf) # 0.7885818
+h2o.auc(gbm_perf) # 0.7947957
+h2o.auc(nb_perf) #  0.7321336
+h2o.auc(glm_perf) # 0.7588988
+```
+
+```{r, eval=F, echo=T}
+# Variable Importance
+# We see that for GBM the new feature (Age) we created was the most important
+# for RF age was the 3rd most important
+# Neural Networks are usually not very good at helping us establish relations
+gbm_fit@model$variable_importances
+rf_fit@model$variable_importances
+```
+
+```{r, eval=F, echo=T}
+# Importance of certain variables on our model
+# Brand.Tesla and AgeGroup 20+ added positively to our clickrate
+glm_fit@model$standardized_coefficient_magnitudes
+```
+
+```{r, eval=F, echo=T}
+# Look at scoring history for GBM model
+# How long did it take for us to reach optimal accuracy
+plot(gbm_fit, 
+     timestep = "number_of_trees", 
+     metric = "AUC")
+
+plot(gbm_fit, 
+     timestep = "number_of_trees", 
+     metric = "logloss")
+```
+
+```{r, eval=F, echo=T}
+# Since GBM was the best performer lets tune it
+# Hyper Parameter Tuning 
+# First Pass
+hyper_params = list( max_depth = seq(1,29,2) ) # Since dataqset is small
+grid <- h2o.grid(
+  hyper_params = hyper_params,
+  ## full Cartesian hyper-parameter search
+  search_criteria = list(strategy = "Cartesian"),
+  algorithm="gbm",
+  grid_id="depth_grid",
+  x = predictors, 
+  y = response, 
+  training_frame = train, 
+  validation_frame = validate,
+  ## here, use "more than enough" trees - we have early stopping
+  ntrees = 10000,                                                            
+  ## since we have learning_rate_annealing, we can afford to start with a bigger learning rate
+  learn_rate = 0.05,                                                         
+  ## learning rate annealing: learning_rate shrinks by 1% after every tree 
+  learn_rate_annealing = 0.99,                                               
+  sample_rate = 0.8,                                                       
+  col_sample_rate = 0.8, 
+  seed = 1234,                                                             
+  ## early stopping once the validation AUC doesn't improve by at least 0.01% for 5 consecutive scoring events
+  stopping_rounds = 5,
+  stopping_tolerance = 1e-4,
+  stopping_metric = "AUC", 
+  ## score every 10 trees to make early stopping reproducible (it depends on the scoring interval)
+  score_tree_interval = 10                                                
+)
+## sort the grid models by decreasing AUC
+sortedGrid <- h2o.getGrid("depth_grid", sort_by="auc", decreasing = TRUE) 
+
+## find the range of max_depth for the top 5 models
+topDepths = sortedGrid@summary_table$max_depth[1:5]                       
+minDepth = min(as.numeric(topDepths))
+maxDepth = max(as.numeric(topDepths))
+```
+
+```{r, eval=F, echo=T}
+# Now that we know a good range for max_depth, 
+# we can tune all other parameters in more detail 
+# Since we don’t know what combinations of hyper-parameters will result in the best model, 
+# we’ll use random hyper-parameter search 
+hyper_params = list( 
+  ## restrict the search to the range of max_depth established above
+  max_depth = seq(minDepth,maxDepth,1),                                      
+  sample_rate = seq(0.2,1,0.01),                                             
+  col_sample_rate = seq(0.2,1,0.01),                                         
+  col_sample_rate_per_tree = seq(0.2,1,0.01),                                
+  col_sample_rate_change_per_level = seq(0.9,1.1,0.01),                      
+  min_rows = 2^seq(0,log2(nrow(train))-1,1),                                 
+  nbins = 2^seq(4,10,1),                                                     
+  nbins_cats = 2^seq(4,12,1),                                                
+  min_split_improvement = c(0,1e-8,1e-6,1e-4),                               
+  histogram_type = c("UniformAdaptive","QuantilesGlobal","RoundRobin")       
+)
+
+search_criteria = list(
+  ## Random grid search
+  strategy = "RandomDiscrete",      
+  ## limit the runtime to 60 minutes
+  max_runtime_secs = 3600,         
+  ## build no more than 100 models
+  max_models = 100,                  
+  seed = 1234,                        
+  ## early stopping once the leaderboard of the top 5 models is converged to 0.1% relative difference
+  stopping_rounds = 5,                
+  stopping_metric = "AUC",
+  stopping_tolerance = 1e-3
+)
+
+grid <- h2o.grid(
+  hyper_params = hyper_params,
+  search_criteria = search_criteria,
+  algorithm = "gbm",
+  grid_id = "final_grid", 
+  x = predictors, 
+  y = response, 
+  training_frame = train, 
+  validation_frame = validate,
+  ntrees = 10000,                                                            
+  learn_rate = 0.05,                                                         
+  learn_rate_annealing = 0.99,                                               
+  max_runtime_secs = 3600,                                                 
+  stopping_rounds = 5, stopping_tolerance = 1e-4, stopping_metric = "AUC", 
+  score_tree_interval = 10,
+  nfolds = 5,
+  seed = 1234                                                             
+)
+
+## Sort the grid models by AUC
+sortedGrid <- h2o.getGrid("final_grid", sort_by = "auc", decreasing = TRUE)    
+sortedGrid #0.79839
+```
+
+```{r, eval=F, echo=T}
+# Choose Best Model
+gbm <- h2o.getModel(sortedGrid@model_ids[[1]])
+print(h2o.auc(h2o.performance(gbm, newdata = test))) # 0.7954955
+```
+
+```{r, eval=F, echo=T}
+# Keeping the same “best” model,
+# we can make test set predictions as follows:
+preds <- h2o.predict(gbm, test)
+head(preds, 10)
+```
+
+```{r, eval=F, echo=T}
+# Final GBM Metrics
+gbm@model$validation_metrics@metrics$max_criteria_and_metric_scores
+```
+
+```{r, eval=F, echo=T}
+# Save Model and Predictions
+h2o.saveModel(gbm, "/tmp/best_model.csv", force=TRUE)
+h2o.exportFile(preds, "/tmp/best_preds.csv", force=TRUE)
+```
